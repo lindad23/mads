@@ -6,7 +6,7 @@ from typing import Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .teachers import CPDRLTeacher, ProCuRLTargetTeacher, TaskSpace
+from .teachers import CPDRLTeacher, ProCuRLTargetTeacher, SFLTeacher, TaskSpace
 
 
 def _task_space_from_minmax(mins: Sequence[float], maxs: Sequence[float]) -> TaskSpace:
@@ -56,6 +56,29 @@ class ProCuRLTargetAdapter(CurriculumTeacherAdapter):
             buffer_size=params.get("buffer_size", 1000),
             target_samples=params.get("target_samples"),
             num_target_samples=params.get("num_target_samples", 250),
+            retrain_interval_episodes=params.get("retrain_interval_episodes", 50),
+            device=params.get("device", "cpu"),
+        )
+
+
+class SFLAdapter(CurriculumTeacherAdapter):
+    def __init__(
+        self,
+        mins: Sequence[float],
+        maxs: Sequence[float],
+        reward_bounds: Optional[Tuple[float, float]] = None,
+        seed: int = 0,
+        params=None,
+    ):
+        params = params or {}
+        self.teacher = SFLTeacher(
+            task_space=_task_space_from_minmax(mins, maxs),
+            seed=seed,
+            success_threshold=params.get("success_threshold", 230.0),
+            temperature=params.get("temperature", 25.0),
+            rho=params.get("rho", 0.5),
+            num_candidates=params.get("num_candidates", 2000),
+            topk=params.get("topk", 200),
             retrain_interval_episodes=params.get("retrain_interval_episodes", 50),
             device=params.get("device", "cpu"),
         )

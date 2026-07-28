@@ -8,14 +8,17 @@ teacher interface exposed here instead of importing external repositories.
 from .teachers import (
     CPDRLTeacher,
     ProCuRLTargetTeacher,
+    SFLTeacher,
     TaskSpace,
 )
-from .adapters import CPDRLAdapter, ProCuRLTargetAdapter
+from .adapters import CPDRLAdapter, ProCuRLTargetAdapter, SFLAdapter
 
 __all__ = [
     "CPDRLAdapter",
     "CPDRLTeacher",
     "ProCuRLTargetAdapter",
     "ProCuRLTargetTeacher",
+    "SFLAdapter",
+    "SFLTeacher",
     "TaskSpace",
 ]

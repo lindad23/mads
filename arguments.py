@@ -35,6 +35,27 @@ parser.add_argument(
     default=DEFAULT_LAMBDA2,
     help='DPS target-alignment weight for theta <- phi.')
 
+# ===== DCES ablation switches (full DCES = all defaults) =====
+parser.add_argument('--use_value_decomposition', type=str2bool, nargs='?', const=True,
+    default=True, help='DCES utility decoupling; False = single centralized critic (regret) [abl #1].')
+parser.add_argument('--use_monotonic_mixing', type=str2bool, nargs='?', const=True,
+    default=True, help='Monotonic (w>0) mixer; False = unconstrained mixer [abl #6].')
+parser.add_argument('--use_policy_conditioning', type=str2bool, nargs='?', const=True,
+    default=True, help='Condition Q_pi_delta on policy feature alpha; False = Q(c) only [abl #4].')
+parser.add_argument('--behavior_feature_mode', type=str, default='rbf',
+    choices=['rbf', 'raw'], help='Policy behavior feature: rbf coeff (DCES) or raw action outputs [abl #5].')
+parser.add_argument('--dps_mode', type=str, default='both',
+    choices=['both', 'none', 'n2c', 'c2n'],
+    help='DPS direction: both / none[#2] / n2c target-align only[#8] / c2n skill-transfer only[#9].')
+parser.add_argument('--static_target_beta', type=float, default=0.0,
+    help='If >0, replace DPS with static target-alignment penalty beta*R(c,c0) [abl #7].')
+parser.add_argument('--use_curriculum_filtering', type=str2bool, nargs='?', const=True,
+    default=True, help='Curriculum sample filtering; False = all samples update [abl #10].')
+parser.add_argument('--mixer_hidden_size', type=int, default=64,
+    help='Hidden width of Q_pi_delta and the monotonic mixer hypernetwork.')
+parser.add_argument('--curriculum_value_coef', type=float, default=1.0,
+    help='Scale of the Q_pi_delta signal used as the curriculum-designer reward.')
+
 parser.add_argument(
     '--adversary_step_magnitude',
     type=float,
@@ -207,7 +228,7 @@ parser.add_argument(
     default='paired',
     choices=['domain_randomization', 'minimax',
              'paired', 'flexible_paired',
-             'alp_gmm', 'procurl_target', 'cp_drl'],
+             'alp_gmm', 'procurl_target', 'cp_drl', 'sfl'],
     help='UED algorithm')
 parser.add_argument(
     '--curriculum_buffer_size',
@@ -268,6 +289,34 @@ parser.add_argument(
     type=int,
     default=512,
     help='Mini-batch size for CP-DRL novelty model updates.')
+parser.add_argument(
+    '--sfl_success_threshold',
+    type=float,
+    default=-99999.0,
+    help='SFL raw-return threshold for "solved". <=-99998 selects an env default '
+         '(230 for Bipedal, 500 for CarRacing).')
+parser.add_argument(
+    '--sfl_temperature',
+    type=float,
+    default=-99999.0,
+    help='SFL sigmoid temperature (return units) mapping predicted return to '
+         'success probability. <=-99998 selects an env default (25 Bipedal, 50 CarRacing).')
+parser.add_argument(
+    '--sfl_rho',
+    type=float,
+    default=0.5,
+    help='SFL probability of drawing a training level from the high-learnability '
+         'buffer (else a fresh domain-randomised level).')
+parser.add_argument(
+    '--sfl_num_candidates',
+    type=int,
+    default=2000,
+    help='Number of fresh random levels SFL scores each buffer refresh.')
+parser.add_argument(
+    '--sfl_topk',
+    type=int,
+    default=200,
+    help='Number of most-learnable levels SFL keeps in its buffer.')
 parser.add_argument(
     '--protagonist_plr',
     type=str2bool, nargs='?', const=True, default=False,

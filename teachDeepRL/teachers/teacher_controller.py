@@ -16,9 +16,9 @@ from teachDeepRL.teachers.algos.random_teacher import RandomTeacher
 from teachDeepRL.teachers.algos.oracle_teacher import OracleTeacher
 from teachDeepRL.teachers.utils.test_utils import get_test_set_name
 from collections import OrderedDict
-from curriculum_baselines import CPDRLAdapter, ProCuRLTargetAdapter
+from curriculum_baselines import CPDRLAdapter, ProCuRLTargetAdapter, SFLAdapter
 
-RAW_REWARD_TEACHERS = {'ProCuRL-Target', 'CP-DRL'}
+RAW_REWARD_TEACHERS = {'ProCuRL-Target', 'CP-DRL', 'SFL'}
 
 def param_vec_to_param_dict(param_env_bounds, param):
     param_dict = OrderedDict()
@@ -82,6 +82,10 @@ class TeacherController(object):
             )
         elif teacher == 'CP-DRL':
             self.task_generator = CPDRLAdapter(
+                mins, maxs, reward_bounds=reward_bounds, seed=seed, params=teacher_params
+            )
+        elif teacher == 'SFL':
+            self.task_generator = SFLAdapter(
                 mins, maxs, reward_bounds=reward_bounds, seed=seed, params=teacher_params
             )
         else:

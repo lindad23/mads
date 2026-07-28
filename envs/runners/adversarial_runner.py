@@ -77,7 +77,7 @@ class AdversarialRunner(object):
         self.is_paired = args.ued_algo in ['paired', 'flexible_paired']
         self.requires_batched_vloss = (args.use_editor and args.base_levels == 'easy' and args.use_accel_paired==False)
 
-        self.teacher_curriculum_algos = ['alp_gmm', 'procurl_target', 'cp_drl']
+        self.teacher_curriculum_algos = ['alp_gmm', 'procurl_target', 'cp_drl', 'sfl']
         self.is_teacher_curriculum = args.ued_algo in self.teacher_curriculum_algos
         self.is_alp_gmm = args.ued_algo == 'alp_gmm'
 
@@ -246,8 +246,26 @@ class AdversarialRunner(object):
             'alp_gmm': 'ALP-GMM',
             'procurl_target': 'ProCuRL-Target',
             'cp_drl': 'CP-DRL',
+            'sfl': 'SFL',
         }[args.ued_algo]
         teacher_params = {}
+        if args.ued_algo == 'sfl':
+            is_carracing = args.env_name.startswith('CarRacing')
+            thr = args.sfl_success_threshold
+            if thr <= -99998.0:
+                thr = 500.0 if is_carracing else 230.0
+            temp = args.sfl_temperature
+            if temp <= -99998.0:
+                temp = 50.0 if is_carracing else 25.0
+            teacher_params.update({
+                'success_threshold': thr,
+                'temperature': temp,
+                'rho': args.sfl_rho,
+                'num_candidates': args.sfl_num_candidates,
+                'topk': args.sfl_topk,
+                'retrain_interval_episodes': args.curriculum_retrain_interval_episodes,
+                'device': str(self.device),
+            })
         if args.ued_algo in ['procurl_target', 'cp_drl']:
             teacher_params.update({
                 'buffer_size': args.curriculum_buffer_size,

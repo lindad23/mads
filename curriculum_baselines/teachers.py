@@ -179,6 +179,131 @@ class ProCuRLTargetTeacher:
         return weights / weights.sum()
 
 
+class SFLTeacher:
+    """Sampling For Learnability (SFL).
+
+    Reference: Rutherford et al., "No Regrets: Investigating and Improving
+    Regret Approximations for Curriculum Discovery", NeurIPS 2024
+    (https://arxiv.org/abs/2408.15099).
+
+    The paper argues that the positive-value-loss regret approximation used by
+    PLR/ACCEL correlates poorly with true regret, and proposes sampling levels
+    by *learnability* instead:
+
+        learnability(theta) = p(theta) * (1 - p(theta)),
+
+    where ``p(theta)`` is the current policy's probability of solving level
+    ``theta``. Levels the agent already solves (p->1) or cannot touch (p->0)
+    score ~0; levels it solves about half the time score highest. Periodically a
+    large batch of random levels is scored, the top-K most learnable are kept in
+    a buffer, and training levels are drawn from that buffer with probability
+    ``rho`` (otherwise a fresh domain-randomised level).
+
+    Framework adaptation (documented in docs/dces_implementation_notes.md and
+    docs/baseline_reproduction.md): the reference implementation estimates
+    ``p`` with a dedicated batched *evaluation phase* that rolls the current
+    policy out on many fresh levels. Our teacher interface only observes the
+    return of each level it proposes, so — exactly like the ProCuRL-Target and
+    CP-DRL reproductions in this file — we fit a small return model on the
+    (level, return) history and read ``p`` off it via a soft success threshold:
+
+        p(theta) = sigmoid((r_hat(theta) - success_threshold) / temperature).
+
+    Everything else (learnability objective, top-K buffer, rho mixing with DR)
+    is faithful to the paper. This is deliberately *not* a regret estimate.
+    """
+
+    def __init__(
+        self,
+        task_space: TaskSpace,
+        seed: int = 0,
+        success_threshold: float = 230.0,
+        temperature: float = 25.0,
+        rho: float = 0.5,
+        num_candidates: int = 2000,
+        topk: int = 200,
+        retrain_interval_episodes: int = 50,
+        device: str = "cpu",
+        **kwargs,
+    ):
+        self.task_space = task_space
+        self.rng = np.random.default_rng(seed)
+        self.success_threshold = float(success_threshold)
+        self.temperature = max(float(temperature), 1e-3)
+        self.rho = float(np.clip(rho, 0.0, 1.0))
+        self.num_candidates = int(num_candidates)
+        self.topk = max(int(topk), 1)
+        self.retrain_interval_episodes = max(int(retrain_interval_episodes), 1)
+        self.device = torch.device(device)
+
+        self.history_tasks = []
+        self.history_returns = []
+        self.episode_counter = 0
+        self.regressor = ReturnRegressor(task_space.dim).to(self.device)
+        self.has_model = False
+        # Before the first fit the buffer is pure domain randomisation.
+        self.buffer = self.task_space.sample_uniform(self.rng, self.topk)
+        self.last_mean_learnability = 0.0
+
+    def sample(self) -> np.ndarray:
+        # rho: exploit the learnable buffer; else fresh domain-randomised level.
+        if self.has_model and len(self.buffer) > 0 and self.rng.random() < self.rho:
+            idx = int(self.rng.integers(len(self.buffer)))
+            return self.buffer[idx].copy()
+        return self.task_space.sample_uniform(self.rng, 1)[0]
+
+    def sample_batch(self, n: int) -> np.ndarray:
+        return np.stack([self.sample() for _ in range(n)], axis=0)
+
+    def update_step(self, *args, **kwargs) -> None:
+        return None
+
+    def update_episode(self, task: ArrayLike, episode_return: float, success: bool = False) -> None:
+        # episode_return is a RAW return (SFL is a raw-reward teacher); success
+        # is derived from the soft threshold inside the learnability estimate.
+        self.history_tasks.append(np.asarray(task, dtype=np.float32))
+        self.history_returns.append(float(episode_return))
+        self.episode_counter += 1
+        if self.episode_counter % self.retrain_interval_episodes == 0:
+            self.refresh_buffer()
+
+    def _learnability(self, tasks: np.ndarray) -> np.ndarray:
+        if not self.has_model:
+            return np.zeros(len(tasks), dtype=np.float32)
+        with torch.no_grad():
+            t = torch.as_tensor(tasks, dtype=torch.float32, device=self.device)
+            r_hat = self.regressor(t).cpu().numpy()
+        p = 1.0 / (1.0 + np.exp(-(r_hat - self.success_threshold) / self.temperature))
+        return (p * (1.0 - p)).astype(np.float32)
+
+    def refresh_buffer(self) -> None:
+        if len(self.history_tasks) < 8:
+            return
+        x = torch.as_tensor(np.asarray(self.history_tasks), dtype=torch.float32, device=self.device)
+        y = torch.as_tensor(np.asarray(self.history_returns), dtype=torch.float32, device=self.device)
+
+        model = ReturnRegressor(self.task_space.dim).to(self.device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
+        batch_size = min(64, len(x))
+        for _ in range(80):
+            order = torch.randperm(len(x), device=self.device)
+            for start in range(0, len(x), batch_size):
+                idx = order[start : start + batch_size]
+                loss = F.mse_loss(model(x[idx]), y[idx])
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+        self.regressor = model
+        self.has_model = True
+
+        candidates = self.task_space.sample_uniform(self.rng, self.num_candidates)
+        learn = self._learnability(candidates)
+        self.last_mean_learnability = float(learn.mean())
+        k = min(self.topk, len(candidates))
+        top_idx = np.argpartition(-learn, k - 1)[:k]
+        self.buffer = candidates[top_idx].copy()
+
+
 class _TransitionPrediction(nn.Module):
     def __init__(self, state_dim: int, action_dim: int, hidden_dim: int):
         super().__init__()

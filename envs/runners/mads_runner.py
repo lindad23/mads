@@ -275,9 +275,13 @@ class MADSRunner(object):
                 # 连续动作 (BipedalWalker)：直接用 action
                 action_vector = action
             
-            # 2. 矩阵乘法求解 Alpha: [N, N] @ [N, ActionDim]
-            alpha = torch.matmul(self.K_inv, action_vector)
-            
+            # 2. Behavior feature: RBF coefficients (DCES) or raw reference-state
+            #    actions (ablation #5, no RBF interpolation, same dimensionality).
+            if getattr(self.args, 'behavior_feature_mode', 'rbf') == 'raw':
+                alpha = action_vector
+            else:
+                alpha = torch.matmul(self.K_inv, action_vector)  # [N, N] @ [N, ActionDim]
+
             # 3. 展平为一维向量
             alpha_flat = alpha.flatten()
             
@@ -836,7 +840,7 @@ class MADSRunner(object):
         return env_return
 
     # MADS: 双策略同步 (DPS)
-    def _dps_synchronize(self, lambda_skill=0.95, lambda_target=0.95):
+    def _dps_synchronize(self, lambda_skill=0.95, lambda_target=0.95, mode='both'):
         """
         参数:
         lambda_skill (float): 控制从 Antagonist 到 Student 的迁移速率。
@@ -878,13 +882,163 @@ class MADSRunner(object):
             # 让 Antagonist (Theta) 被拉回一点，不要在变异环境中玩得太偏
             new_theta_state[key] = lambda_target * param_theta + (1 - lambda_target) * param_phi
 
-        # 将计算好的新参数加载回模型
-        student_model.load_state_dict(new_phi_state)
-        antagonist_model.load_state_dict(new_theta_state)
+        # Apply directions per ablation mode:
+        #   both -> both; none -> neither;
+        #   c2n  -> skill transfer only (update phi/native from theta) [abl #9];
+        #   n2c  -> target anchoring only (update theta/curriculum from phi) [abl #8].
+        if mode in ('both', 'c2n'):
+            student_model.load_state_dict(new_phi_state)     # phi <- ... theta
+        if mode in ('both', 'n2c'):
+            antagonist_model.load_state_dict(new_theta_state)  # theta <- ... phi
         return {
             'dps_lambda_skill': lambda_skill,
             'dps_lambda_target': lambda_target,
+            'dps_mode': mode,
         }
+
+    def _dces_utility_decoupling(self, current_alpha):
+        """DCES value decomposition. Trains Q_tot = w1*Q_pi_theta + w2*Q_pi_delta by
+        TD on the shared reward, and returns the curriculum-specific value Q_pi_delta
+        (per env, shape [N]) to be used as the curriculum-designer reward.
+
+        Uses the curriculum learner (`adversary_agent`, pi_theta) trajectory.
+        """
+        import numpy as _np
+        from models.mads_mixer import UtilityDecomposition
+        st = self.agents['adversary_agent'].storage
+        dev = self.device
+
+        # curriculum params c per env = SEMANTIC complexity params (roughness, pit gaps,
+        # stump heights, ... in a sane range) from get_complexity_info(). NOT get_level(),
+        # which returns a huge non-semantic encoding (~1e8) that Q_pi_delta cannot learn from.
+        infos = self.ued_venv.get_complexity_info()   # list of N dicts
+        if not hasattr(self, '_c_keys'):
+            self._c_keys = sorted(k for k, v in infos[0].items()
+                                  if isinstance(v, (int, float, bool)))
+        c = torch.as_tensor(
+            _np.asarray([[float(info[k]) for k in self._c_keys] for info in infos],
+                        dtype=_np.float32), device=dev)
+        if c.dim() == 1:
+            c = c.unsqueeze(-1)
+        N = c.shape[0]
+
+        # alpha (RBF policy feature), shape [alpha_dim] -> broadcast to envs
+        alpha = torch.as_tensor(_np.asarray(current_alpha, dtype=_np.float32), device=dev)
+        alpha_row = alpha.unsqueeze(0).expand(N, -1)  # [N, alpha_dim]
+
+        # trajectory tensors from the curriculum learner
+        obs = st.obs[:-1].to(dev)                 # [T, N, obs_dim...]
+        returns = st.returns[:-1].to(dev)         # GAE return-to-go [T, N, 1]
+        T = obs.shape[0]
+        state = obs.reshape(T * N, -1).float()
+        # IQL targets (normalized): step return for Q_pi_theta/Q_tot, episode return for Q_pi_delta
+        ret_flat = returns.reshape(T * N).float()
+        step_target = (ret_flat - ret_flat.mean()) / (ret_flat.std() + 1e-6)
+        # Q_pi_delta target (choice B): the regret/learnability signal = antagonist
+        # advantage (returns - value_preds), per curriculum. It removes the value
+        # baseline (the alpha/training-progress level), leaving a learnable,
+        # c-dependent curriculum-quality signal -- the same signal the original
+        # runner uses directly as the curriculum reward.
+        value_preds = st.value_preds[:-1].to(dev)                 # [T, N, 1]
+        ep_ret = (returns - value_preds).mean(dim=0).reshape(N).float()  # regret per curriculum
+
+        # lazily build the decomposition module + optimizer
+        if getattr(self, 'util_decomp', None) is None:
+            self.util_decomp = UtilityDecomposition(
+                state_dim=state.shape[-1], alpha_dim=alpha.shape[-1], c_dim=c.shape[-1],
+                hidden=self.args.mixer_hidden_size,
+                use_monotonic=self.args.use_monotonic_mixing,
+                use_policy_conditioning=self.args.use_policy_conditioning,
+            ).to(dev)
+            self.util_optimizer = torch.optim.Adam(
+                self.util_decomp.parameters(), lr=self.args.lr)
+
+        # === curriculum replay buffer + running return normalizer ===
+        # Learning Q_pi_delta(alpha,c) -> episode return from only N=16 noisy points
+        # per update collapses. Accumulate (alpha,c,return) across updates and train on
+        # minibatches toward a running-normalized target so it actually learns.
+        if not hasattr(self, '_cur_buf'):
+            from collections import deque
+            self._cur_buf = deque(maxlen=8192)
+        # store the WITHIN-UPDATE-standardized episode return: this removes the
+        # training-progress (alpha) level so Q_pi_delta must explain the *relative*
+        # curriculum quality from c, instead of exploiting the alpha->return trend.
+        ep_np = ((ep_ret - ep_ret.mean()) / (ep_ret.std() + 1e-6)).detach().cpu().numpy()
+        a_np = alpha.detach().cpu().numpy()
+        c_np = c.detach().cpu().numpy()
+        for n in range(N):
+            self._cur_buf.append((a_np, c_np[n], float(ep_np[n])))
+
+        # per-env alpha/c broadcast over the T timesteps (for Q_tot mixer)
+        alpha_step = alpha_row.unsqueeze(0).expand(T, N, -1).reshape(T * N, -1)
+        c_step = c.unsqueeze(0).expand(T, N, -1).reshape(T * N, -1)
+
+        # Q_pi_theta + Q_tot on current-batch step returns (IQL, step-level)
+        q_pi = self.util_decomp.policy_critic(state)
+        q_delta_step = self.util_decomp.curriculum_critic(alpha_step, c_step)
+        q_tot, w1, w2 = self.util_decomp.mixer(q_pi, q_delta_step, state)
+        l_pi = torch.nn.functional.mse_loss(q_pi, step_target)
+        l_tot = torch.nn.functional.mse_loss(q_tot, step_target)
+
+        import random as _random
+
+        def _delta_loss():
+            batch = _random.sample(self._cur_buf, min(512, len(self._cur_buf)))
+            ba = torch.as_tensor(_np.stack([b[0] for b in batch]), dtype=torch.float32, device=dev)
+            bc = torch.as_tensor(_np.stack([b[1] for b in batch]), dtype=torch.float32, device=dev)
+            btgt = torch.as_tensor(_np.asarray([b[2] for b in batch], dtype=_np.float32), device=dev)
+            return torch.nn.functional.mse_loss(self.util_decomp.curriculum_critic(ba, bc), btgt)
+
+        # combined step: Q_pi_theta + Q_tot (step returns) + one Q_pi_delta step
+        l_delta = _delta_loss() if len(self._cur_buf) >= 64 else torch.zeros((), device=dev)
+        loss = l_pi + l_tot + l_delta
+        self.util_optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.util_decomp.parameters(), self.args.max_grad_norm)
+        self.util_optimizer.step()
+
+        # extra Q_pi_delta optimization -- the c->regret signal is weak/noisy (small
+        # curriculum perturbations), so give the curriculum critic more gradient steps.
+        if len(self._cur_buf) >= 64:
+            for _ in range(9):
+                ld = _delta_loss()
+                self.util_optimizer.zero_grad()
+                ld.backward()
+                torch.nn.utils.clip_grad_norm_(self.util_decomp.parameters(), self.args.max_grad_norm)
+                self.util_optimizer.step()
+                l_delta = ld
+
+        with torch.no_grad():
+            q_delta_env = self.util_decomp.curriculum_critic(alpha_row, c)  # [N]
+        info = {'l_pi': l_pi.item(), 'l_delta': float(l_delta), 'l_tot': l_tot.item(),
+                'q_delta': q_delta_env.mean().item(), 'q_delta_std': q_delta_env.std().item(),
+                'w1': w1.mean().item(), 'w2': w2.mean().item(), 'buf': len(self._cur_buf),
+                'c_std': c.std(0).mean().item(), 'c_absmean': c.abs().mean().item(),
+                'reg_std': ep_ret.std().item()}
+
+        # Q_pi_delta (episodic curriculum value) -> curriculum-designer reward
+        env_return = (q_delta_env.detach() * self.args.curriculum_value_coef)
+        env_return = env_return - env_return.mean()       # center to zero-mean reward
+
+        # ablation #10: curriculum sample filtering -- keep above-median-value curricula
+        # (zero out the rest) so noisy low-value samples don't drive the designer.
+        if self.args.use_curriculum_filtering:
+            med = env_return.median()
+            env_return = torch.where(env_return >= med, env_return, torch.zeros_like(env_return))
+
+        # ablation #7: static target-alignment penalty  J_curriculum - beta * R(c, c0)
+        if self.args.static_target_beta > 0:
+            if not hasattr(self, '_c0'):
+                t_infos = self.venv.get_complexity_info()
+                self._c0 = torch.as_tensor(_np.asarray(
+                    [[float(ti[k]) for k in self._c_keys] for ti in t_infos],
+                    dtype=_np.float32), device=dev).mean(0)   # target curriculum params
+            R = ((c - self._c0.unsqueeze(0)) ** 2).mean(dim=-1)   # [N]
+            env_return = env_return - self.args.static_target_beta * R
+
+        if env_return.dim() == 1:
+            env_return = env_return.unsqueeze(-1)          # [N] -> [N,1]
+        return env_return, info
 
     def run(self):
         args = self.args
@@ -963,8 +1117,14 @@ class MADSRunner(object):
             'num_edits': [0 for _ in range(args.num_processes)]
         }
 
-        # Update adversary agent final return
-        env_return = self._compute_env_return(agent_info, adversary_agent_info)
+        # Update adversary agent final return.
+        # DCES: use the decoupled curriculum-specific value Q_pi_delta; otherwise
+        # fall back to the regret signal (== ablation "w/o utility decoupling").
+        dces_info = {}
+        if self.is_training and args.use_value_decomposition:
+            env_return, dces_info = self._dces_utility_decoupling(current_alpha)
+        else:
+            env_return = self._compute_env_return(agent_info, adversary_agent_info)
 
         adversary_env_info = defaultdict(float)
         if self.is_training and self.is_training_env:
@@ -987,10 +1147,16 @@ class MADSRunner(object):
             self.num_updates += 1
             # MADS DPS: keep the dynamic learner pi_theta and target learner
             # pi_phi softly synchronized with fixed lambda weights.
-            dps_info = self._dps_synchronize(
-                lambda_skill=args.lambda1,
-                lambda_target=args.lambda2,
-            )
+            if args.static_target_beta > 0:
+                # ablation #7: replace adaptive DPS with a fixed target-alignment
+                # penalty (applied to the curriculum reward inside _dces).
+                dps_info = {'dps_mode': 'static'}
+            else:
+                dps_info = self._dps_synchronize(
+                    lambda_skill=args.lambda1,
+                    lambda_target=args.lambda2,
+                    mode=args.dps_mode,
+                )
         else:
             dps_info = {}
 
@@ -1006,6 +1172,8 @@ class MADSRunner(object):
                 'adversary_env_value_loss': adversary_env_info['value_loss'],
                 'adversary_env_dist_entropy': adversary_env_info['dist_entropy'],
             })
+            for _k, _v in dces_info.items():
+                stats[f'dces_{_k}'] = _v
         else:
             stats = self.latest_env_stats.copy()
 
